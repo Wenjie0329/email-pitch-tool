@@ -21,7 +21,7 @@ A lightweight email outreach automation tool. Send personalized cold emails, set
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/email-pitch-tool.git
+git clone https://github.com/Wenjie0329/email-pitch-tool.git
 cd email-pitch-tool
 pip install -r requirements.txt
 ```
@@ -292,6 +292,14 @@ When using this tool, please comply with applicable email regulations:
 ## License
 
 MIT License
+
+---
+
+## Acknowledgments
+
+This project is based on [email-pitch-tool](https://github.com/cwrwww/email-pitch-tool) by [@cwrwww](https://github.com/cwrwww). Thanks Bruce for building the original version!
+
+Key changes in this fork: fixed open rate tracking (tracking pixel, cache-busting, response headers), added Markdown email template support, and improved the setup documentation.
 
 ---
 
