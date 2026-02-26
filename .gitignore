@@ -1,0 +1,39 @@
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Credentials & Tokens
+credentials.json
+token.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Backup files
+*.backup
+*.backup-v1
+
+# Test files
+test_*.py
+test_*.html
+nul
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tracker submodule build artifacts
+tracker-render/*.db

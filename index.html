@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Email Pitch Tool</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: system-ui, sans-serif; background: #f5f5f5; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { margin-bottom: 20px; color: #333; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .card h2 { margin-bottom: 15px; font-size: 18px; color: #444; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+        input, textarea, select, button { padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+        input, textarea, select { width: 100%; margin-bottom: 10px; }
+        textarea { min-height: 120px; font-family: monospace; }
+        button { background: #4A90D9; color: white; border: none; cursor: pointer; }
+        button:hover { background: #357ABD; }
+        button.danger { background: #e74c3c; }
+        .btn-sm { padding: 6px 12px; font-size: 12px; }
+        .status { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+        .status.running { background: #27ae60; color: white; }
+        .status.draft { background: #95a5a6; color: white; }
+        .status.paused { background: #f39c12; color: white; }
+        .status.replied { background: #9b59b6; color: white; }
+        .status.completed { background: #3498db; color: white; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; }
+        th { background: #f8f9fa; }
+        .stats { display: flex; gap: 20px; flex-wrap: wrap; }
+        .stat { text-align: center; padding: 15px; background: #f8f9fa; border-radius: 8px; min-width: 100px; }
+        .stat .num { font-size: 24px; font-weight: bold; color: #4A90D9; }
+        .stat .label { font-size: 12px; color: #666; }
+        .tabs { display: flex; gap: 10px; margin-bottom: 15px; }
+        .tab { padding: 8px 16px; cursor: pointer; border-bottom: 2px solid transparent; }
+        .tab.active { border-bottom-color: #4A90D9; color: #4A90D9; }
+        .help { font-size: 12px; color: #888; margin-top: 5px; }
+        .msg { padding: 10px; background: #d4edda; color: #155724; border-radius: 4px; margin-bottom: 15px; }
+        #preview { background: #f8f9fa; padding: 15px; border-radius: 4px; margin-top: 10px; }
+
+        /* 预览容器内容限制 */
+        #previewBody * {
+            max-width: 100%;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+        }
+        #previewBody img, #previewBody table, #previewBody pre {
+            max-width: 100% !important;
+            height: auto !important;
+        }
+        #previewBody table {
+            display: block;
+            overflow-x: auto;
+        }
+
+        /* 抖动动画 */
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            20%, 60% { transform: translateX(-5px); }
+            40%, 80% { transform: translateX(5px); }
+        }
+        .shake { animation: shake 0.4s ease-in-out; border-color: #e74c3c !important; }
+
+        /* 数字输入框美化 */
+        .num-input {
+            display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+        }
+        .num-input input {
+            width: 80px; text-align: center; margin: 0;
+        }
+        .num-input button {
+            width: 32px; height: 32px; padding: 0; font-size: 18px; line-height: 1;
+        }
+        .num-input span { color: #666; font-size: 14px; }
+
+        /* Toast 提示 */
+        .toast {
+            position: fixed; top: 20px; right: 20px; padding: 15px 25px;
+            border-radius: 8px; color: white; font-size: 14px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 9999;
+            animation: slideIn 0.3s ease;
+        }
+        .toast.success { background: #27ae60; }
+        .toast.error { background: #e74c3c; }
+        .toast.warning { background: #f39c12; }
+        .toast.info { background: #3498db; }
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
+        /* 确认弹窗美化 */
+        .modal-overlay {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5); display: flex;
+            align-items: center; justify-content: center; z-index: 1000;
+        }
+        .modal-box {
+            background: white; padding: 25px; border-radius: 12px;
+            max-width: 400px; width: 90%; box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }
+        .modal-box h3 { margin: 0 0 15px; color: #333; }
+        .modal-box p { color: #666; margin-bottom: 20px; }
+        .modal-box .btn-group { display: flex; gap: 10px; justify-content: flex-end; }
+        .modal-box button { min-width: 80px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Email Pitch Tool</h1>
+
+        <div id="msg"></div>
+
+        <!-- ✏️ CHANGED: New settings card for BASE_URL configuration -->
+        <div class="card" id="settingsCard">
+            <h2>Tracking Settings</h2>
+            <div id="baseUrlWarning" style="background:#fff3cd;color:#856404;padding:10px 15px;border-radius:4px;margin-bottom:10px;display:none">
+                ⚠ BASE_URL is set to localhost — open/click tracking will NOT work! Please enter a public URL below (e.g. from <code>ngrok http 8000</code>).
+            </div>
+            <label>BASE_URL (your server's public URL for tracking)</label>
+            <div style="display:flex;gap:10px;align-items:start">
+                <input type="text" id="baseUrlInput" placeholder="https://abc123.ngrok.io" style="flex:1;margin-bottom:0">
+                <button onclick="saveBaseUrl()">Save</button>
+            </div>
+            <p class="help">This URL is embedded in tracking pixels inside emails. It must be reachable from the internet (not localhost). Use <a href="https://ngrok.com" target="_blank">ngrok</a> for local testing.</p>
+        </div>
+        <!-- end of CHANGED section -->
+
+        <div class="grid">
+            <div class="card">
+                <h2>Gmail 账号</h2>
+                <div id="accounts"></div>
+                <button onclick="location.href='/oauth/start'">+ 绑定Gmail账号</button>
+            </div>
+
+            <div class="card">
+                <h2>新建 Campaign</h2>
+                <input type="text" id="campaignName" placeholder="Campaign名称">
+                <button onclick="createCampaign()">创建</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Campaigns</h2>
+            <table>
+                <thead><tr><th>ID</th><th>名称</th><th>状态</th><th>操作</th></tr></thead>
+                <tbody id="campaigns"></tbody>
+            </table>
+        </div>
+
+        <div class="card" id="campaignDetail" style="display:none">
+            <h2>Campaign 详情: <span id="detailName"></span></h2>
+
+            <div class="tabs">
+                <div class="tab active" onclick="showTab('templates')">邮件模板</div>
+                <div class="tab" onclick="showTab('leads')">收件人</div>
+                <div class="tab" onclick="showTab('stats')">数据统计</div>
+                <div class="tab" onclick="showTab('launch')">发送设置</div>
+            </div>
+
+            <div id="tab-templates">
+                <h3 style="margin:15px 0">添加邮件模板</h3>
+                <div class="grid">
+                    <div>
+                        <label>步骤序号</label>
+                        <div class="num-input">
+                            <button type="button" onclick="adjustNum('tplStep', -1)">−</button>
+                            <input type="number" id="tplStep" value="1" min="1">
+                            <button type="button" onclick="adjustNum('tplStep', 1)">+</button>
+                            <span>第几封邮件</span>
+                        </div>
+                        <label>邮件主题 (支持变量如 {{first_name}})</label>
+                        <input type="text" id="tplSubject" placeholder="Hi {{first_name}}, quick question" oninput="updatePreview()">
+                        <label>邮件内容 (支持纯文本或HTML格式)</label>
+                        <textarea id="tplBody" placeholder="Hi {{first_name}},
+
+I noticed your company {{company}} is growing fast.
+Check out our **latest case study**: [click here](https://example.com)
+
+Would love to chat about how we can help.
+
+Best regards" oninput="updatePreview()"></textarea>
+                        <label>等待天数 (发送此步骤前等待)</label>
+                        <div class="num-input">
+                            <button type="button" onclick="adjustNum('tplDelay', -1)">−</button>
+                            <input type="number" id="tplDelay" value="0" min="0">
+                            <button type="button" onclick="adjustNum('tplDelay', 1)">+</button>
+                            <span>天后发送</span>
+                        </div>
+                        <div style="margin-top:15px">
+                            <button id="tplSubmitBtn" onclick="addTemplate()">添加模板</button>
+                            <button id="tplCancelBtn" onclick="resetTemplateForm()" style="display:none;background:#ccc">取消编辑</button>
+                        </div>
+                        <p class="help">直接输入文字即可，也支持HTML。链接: [文字](网址)　图片: ![描述](图片网址)　粗体: **文字**　斜体: *文字*　直接贴URL也会自动变成链接。变量: {{name|默认值}}</p>
+                    </div>
+                    <div>
+                        <label>实时预览 (示例数据)</label>
+                        <div style="background:#fff;border:1px solid #ddd;border-radius:4px;padding:15px;min-height:200px;max-height:500px;overflow:auto">
+                            <div style="color:#666;font-size:12px;margin-bottom:10px">
+                                <strong>主题:</strong> <span id="previewSubject">-</span>
+                            </div>
+                            <hr style="border:none;border-top:1px solid #eee;margin:10px 0">
+                            <div id="previewBody" style="font-size:14px;word-wrap:break-word;overflow-wrap:break-word">输入内容后显示预览...</div>
+                        </div>
+                        <p class="help" style="margin-top:10px">预览使用示例数据: first_name=John, company=Acme Inc, title=CEO</p>
+                    </div>
+                </div>
+
+                <h3 style="margin:20px 0 10px">已添加模板</h3>
+                <div id="templateList"></div>
+            </div>
+
+            <div id="tab-leads" style="display:none">
+                <div id="requiredVarsBox" style="background:#e8f4fd;padding:15px;border-radius:4px;margin-bottom:15px;display:none">
+                    <strong>模板需要的变量:</strong> <span id="requiredVarsList"></span>
+                    <p class="help" style="margin-top:5px">导入的数据需要包含这些列，缺失时需要设置默认值</p>
+                </div>
+
+                <div class="grid">
+                    <div>
+                        <h3 style="margin:15px 0">手动添加</h3>
+                        <input type="email" id="manualEmail" placeholder="邮箱 *">
+                        <div id="manualFieldsBox"></div>
+                        <button onclick="addManualLead()">添加</button>
+                    </div>
+                    <div>
+                        <h3 style="margin:15px 0">上传文件</h3>
+                        <input type="file" id="leadsFile" accept=".csv,.xlsx,.xls">
+                        <button onclick="checkAndUploadLeads()">上传CSV/Excel</button>
+                    </div>
+                </div>
+
+                <h3 style="margin:20px 0 10px">批量粘贴</h3>
+                <p class="help">从Excel复制粘贴，第一行为表头，用Tab分隔。必须包含email列。</p>
+                <textarea id="pasteArea" placeholder="email	first_name	company
+john@example.com	John	Acme Inc
+jane@example.com	Jane	Tech Corp" style="min-height:150px;white-space:pre"></textarea>
+                <button onclick="checkAndParsePasted()">解析粘贴数据</button>
+
+                <h3 style="margin:20px 0 10px">收件人列表 <span id="leadsCount" style="font-weight:normal;color:#888"></span></h3>
+                <table>
+                    <thead><tr><th>Email</th><th>状态</th><th>当前步骤</th><th>最后发送</th><th>已打开</th><th>已点击</th><th>已回复</th><th>操作</th></tr></thead>
+                    <tbody id="leadsList"></tbody>
+                </table>
+            </div>
+
+            <div id="tab-stats" style="display:none">
+                <button onclick="loadStats()" style="margin-bottom:15px">刷新统计</button>
+                <button onclick="checkRepliesNow()" style="margin-bottom:15px;margin-left:10px">立即检查回复</button>
+                <div class="stats" id="statsBox"></div>
+            </div>
+
+            <div id="tab-launch" style="display:none">
+                <h3 style="margin:15px 0">发送设置</h3>
+                <label>发件账号</label>
+                <select id="sendAccount"></select>
+                <label>发送间隔 (分钟)</label>
+                <input type="number" id="sendInterval" value="5" min="1">
+                <button onclick="launchCampaign()">启动发送</button>
+                <button class="danger" onclick="stopCampaign()">暂停</button>
+            </div>
+        </div>
+
+        <div id="previewModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);padding:50px">
+            <div style="background:white;max-width:600px;margin:0 auto;padding:20px;border-radius:8px;max-height:80vh;overflow:auto">
+                <h3>邮件预览</h3>
+                <div id="preview"></div>
+                <button onclick="document.getElementById('previewModal').style.display='none'" style="margin-top:15px">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentCampaign = null;
+        let requiredVariables = [];  // 模板需要的变量
+
+        // Toast 提示
+        function toast(msg, type = 'info', duration = 3000) {
+            const t = document.createElement('div');
+            t.className = 'toast ' + type;
+            t.textContent = msg;
+            document.body.appendChild(t);
+            setTimeout(() => t.remove(), duration);
+        }
+
+        // 确认弹窗
+        function showConfirm(title, message) {
+            return new Promise(resolve => {
+                const html = `
+                    <div class="modal-overlay" id="confirmModal">
+                        <div class="modal-box">
+                            <h3>${title}</h3>
+                            <p>${message}</p>
+                            <div class="btn-group">
+                                <button onclick="document.getElementById('confirmModal').remove();window._confirmResolve(false)" style="background:#ccc">取消</button>
+                                <button onclick="document.getElementById('confirmModal').remove();window._confirmResolve(true)">确定</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                document.body.insertAdjacentHTML('beforeend', html);
+                window._confirmResolve = resolve;
+            });
+        }
+
+        // 数字输入调整
+        function adjustNum(id, delta) {
+            const input = document.getElementById(id);
+            const min = parseInt(input.min) || 0;
+            const val = Math.max(min, parseInt(input.value || 0) + delta);
+            input.value = val;
+        }
+
+        // 抖动效果
+        function shakeElement(el) {
+            el.classList.add('shake');
+            setTimeout(() => el.classList.remove('shake'), 400);
+        }
+
+        async function api(url, opts = {}) {
+            const res = await fetch(url, opts);
+            return res.json();
+        }
+
+        async function loadRequiredVariables() {
+            const res = await api(`/api/campaigns/${currentCampaign}/variables`);
+            requiredVariables = res.variables || [];
+
+            const box = document.getElementById('requiredVarsBox');
+            if (requiredVariables.length > 0) {
+                box.style.display = 'block';
+                document.getElementById('requiredVarsList').innerHTML =
+                    requiredVariables.map(v => `<code style="background:#fff;padding:2px 6px;border-radius:3px;margin:0 3px">{{${v}}}</code>`).join('');
+
+                // 动态生成手动添加的输入框
+                document.getElementById('manualFieldsBox').innerHTML =
+                    requiredVariables.map(v => `<input type="text" id="manual_${v}" placeholder="${v}">`).join('');
+            } else {
+                box.style.display = 'none';
+                document.getElementById('manualFieldsBox').innerHTML =
+                    '<input type="text" id="manual_first_name" placeholder="first_name"><input type="text" id="manual_company" placeholder="company">';
+            }
+        }
+
+        async function loadAccounts() {
+            const accounts = await api('/api/accounts');
+            document.getElementById('accounts').innerHTML = accounts.length
+                ? accounts.map(a => `<div style="margin-bottom:8px">${a.email}</div>`).join('')
+                : '<p style="color:#888">暂无绑定账号</p>';
+            const select = document.getElementById('sendAccount');
+            select.innerHTML = accounts.map(a => `<option value="${a.email}">${a.email}</option>`).join('');
+        }
+
+        async function loadCampaigns() {
+            const campaigns = await api('/api/campaigns');
+            document.getElementById('campaigns').innerHTML = campaigns.map(c => `
+                <tr>
+                    <td>${c.id}</td>
+                    <td>${c.name}</td>
+                    <td><span class="status ${c.status}">${c.status}</span></td>
+                    <td>
+                        <button class="btn-sm" onclick="openCampaign(${c.id}, '${c.name}')">管理</button>
+                        <button class="btn-sm danger" onclick="deleteCampaign(${c.id}, '${c.name}')" style="margin-left:8px">删除</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        async function createCampaign() {
+            const name = document.getElementById('campaignName').value;
+            if (!name) return toast('请输入名称', 'error');
+            const fd = new FormData();
+            fd.append('name', name);
+            await api('/api/campaigns', { method: 'POST', body: fd });
+            document.getElementById('campaignName').value = '';
+            loadCampaigns();
+        }
+
+        async function openCampaign(id, name) {
+            currentCampaign = id;
+            document.getElementById('detailName').textContent = name;
+            document.getElementById('campaignDetail').style.display = 'block';
+            showTab('templates');
+            loadTemplates();
+            loadLeads();
+            loadStats();
+            loadCampaignSettings();
+            loadRequiredVariables();
+        }
+
+        async function loadCampaignSettings() {
+            const campaign = await api(`/api/campaigns/${currentCampaign}`);
+            if (campaign.account_email) {
+                document.getElementById('sendAccount').value = campaign.account_email;
+            }
+            if (campaign.interval_minutes) {
+                document.getElementById('sendInterval').value = campaign.interval_minutes;
+            }
+        }
+
+        function showDefaultsModal(missingVars, callback) {
+            const html = `
+                <div class="modal-overlay" id="defaultsModal">
+                    <div class="modal-box" style="max-width:450px">
+                        <h3>设置缺失变量的默认值</h3>
+                        <p>导入的数据缺少以下变量，请设置默认值（留空则该变量为空）：</p>
+                        ${missingVars.map(v => `
+                            <label style="display:block;margin-bottom:5px;margin-top:10px">${v}</label>
+                            <input type="text" id="default_${v}" placeholder="输入默认值...">
+                        `).join('')}
+                        <div class="btn-group" style="margin-top:20px">
+                            <button onclick="document.getElementById('defaultsModal').remove()" style="background:#ccc">取消</button>
+                            <button onclick="confirmDefaults()">确认导入</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.body.insertAdjacentHTML('beforeend', html);
+            window.pendingImportCallback = callback;
+        }
+
+        function confirmDefaults() {
+            const defaults = {};
+            requiredVariables.forEach(v => {
+                const input = document.getElementById('default_' + v);
+                if (input && input.value) {
+                    defaults[v] = input.value;
+                }
+            });
+            document.getElementById('defaultsModal').remove();
+            if (window.pendingImportCallback) {
+                window.pendingImportCallback(defaults);
+            }
+        }
+
+        function showTab(name) {
+            document.querySelectorAll('[id^="tab-"]').forEach(el => el.style.display = 'none');
+            document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+            document.getElementById('tab-' + name).style.display = 'block';
+            event.target.classList.add('active');
+        }
+
+        // 示例数据用于预览
+        const sampleData = {
+            first_name: 'John',
+            last_name: 'Doe',
+            company: 'Acme Inc',
+            title: 'CEO',
+            email: 'john@example.com'
+        };
+
+        function updatePreview() {
+            const subject = document.getElementById('tplSubject').value;
+            const body = document.getElementById('tplBody').value;
+
+            // 简单的变量替换 (支持 {{var}} 和 {{var|default}})
+            function replaceVars(text) {
+                return text.replace(/\{\{(\w+)(?:\|([^}]*))?\}\}/g, (match, key, defaultVal) => {
+                    return sampleData[key] || defaultVal || match;
+                });
+            }
+
+            document.getElementById('previewSubject').textContent = replaceVars(subject) || '-';
+            // ✏️ CHANGED: Auto-detect plain text vs HTML for preview (with Markdown support)
+            let previewBody = replaceVars(body);
+            if (previewBody && !/<[a-zA-Z][^>]*>/.test(previewBody)) {
+                // Plain text mode: process Markdown syntax, then escape remaining text
+                // 1. Extract Markdown patterns first
+                let md = previewBody;
+                const tokens = [];
+                // Images: ![alt](url)
+                md = md.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (m,alt,url) => { tokens.push(`<img src="${url}" alt="${alt}" style="max-width:100%">`); return `\x00${tokens.length-1}\x00`; });
+                // Links: [text](url)
+                md = md.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m,text,url) => { tokens.push(`<a href="${url}" target="_blank">${text}</a>`); return `\x00${tokens.length-1}\x00`; });
+                // Bold: **text**
+                md = md.replace(/\*\*(.+?)\*\*/g, (m,text) => { tokens.push(`<b>${text}</b>`); return `\x00${tokens.length-1}\x00`; });
+                // Italic: *text*
+                md = md.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, (m,text) => { tokens.push(`<i>${text}</i>`); return `\x00${tokens.length-1}\x00`; });
+                // 2. Escape remaining plain text
+                md = md.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                // 3. Auto-link bare URLs
+                md = md.replace(/(https?:\/\/[^\s<&]+)/g, '<a href="$1" target="_blank">$1</a>');
+                // 4. Restore Markdown tokens
+                md = md.replace(/\x00(\d+)\x00/g, (m,i) => tokens[parseInt(i)]);
+                // 5. Newlines to <br>
+                previewBody = md.replace(/\n/g, '<br>');
+            }
+            document.getElementById('previewBody').innerHTML = previewBody || '输入内容后显示预览...';
+        }
+
+        async function addTemplate() {
+            const subjectEl = document.getElementById('tplSubject');
+            const bodyEl = document.getElementById('tplBody');
+            const subject = subjectEl.value.trim();
+            const body = bodyEl.value.trim();
+
+            // 验证
+            let valid = true;
+            if (!subject) { shakeElement(subjectEl); valid = false; }
+            if (!body) { shakeElement(bodyEl); valid = false; }
+            if (!valid) {
+                toast('请填写邮件主题和内容', 'error');
+                return;
+            }
+
+            const fd = new FormData();
+            fd.append('step', document.getElementById('tplStep').value);
+            fd.append('subject', subject);
+            fd.append('body', body);
+            fd.append('delay_days', document.getElementById('tplDelay').value);
+            await api(`/api/campaigns/${currentCampaign}/templates`, { method: 'POST', body: fd });
+            toast('模板添加成功', 'success');
+            loadTemplates();
+            // 清空表单
+            document.getElementById('tplSubject').value = '';
+            document.getElementById('tplBody').value = '';
+            updatePreview();
+        }
+
+        let templatesCache = [];  // 缓存模板数据
+
+        async function loadTemplates() {
+            const templates = await api(`/api/campaigns/${currentCampaign}/templates`);
+            templatesCache = templates;  // 缓存数据供编辑使用
+            document.getElementById('templateList').innerHTML = templates.map(t => `
+                <div style="background:#f8f9fa;padding:10px;margin-bottom:10px;border-radius:4px;position:relative">
+                    <div style="position:absolute;right:10px;top:10px">
+                        <button class="btn-sm" onclick="editTemplate(${t.id})">编辑</button>
+                        <button class="btn-sm danger" onclick="deleteTemplate(${t.id})">删除</button>
+                    </div>
+                    <strong>Step ${t.step}</strong> (等待${t.delay_days}天) <br>
+                    主题: ${t.subject}<br>
+                    <small style="color:#666">${t.body.substring(0, 100)}...</small>
+                </div>
+            `).join('') || '<p style="color:#888">暂无模板</p>';
+            loadRequiredVariables();  // 模板变化后刷新变量
+        }
+
+        async function deleteTemplate(tid) {
+            const confirmed = await showConfirm('删除模板', '确定要删除此模板吗？');
+            if (!confirmed) return;
+            await fetch(`/api/templates/${tid}`, { method: 'DELETE' });
+            toast('模板已删除', 'success');
+            loadTemplates();
+        }
+
+        let editingTemplateId = null;
+
+        function editTemplate(tid) {
+            // 从缓存中获取模板数据
+            const template = templatesCache.find(t => t.id === tid);
+            if (!template) return toast('模板不存在', 'error');
+
+            editingTemplateId = tid;
+            document.getElementById('tplStep').value = template.step;
+            document.getElementById('tplSubject').value = template.subject;
+            document.getElementById('tplBody').value = template.body;
+            document.getElementById('tplDelay').value = template.delay_days;
+            updatePreview();
+
+            // 更改按钮
+            const btn = document.getElementById('tplSubmitBtn');
+            btn.textContent = '保存修改';
+            btn.setAttribute('onclick', 'saveTemplateEdit()');
+            document.getElementById('tplCancelBtn').style.display = 'inline-block';
+        }
+
+        async function saveTemplateEdit() {
+            const fd = new FormData();
+            fd.append('step', document.getElementById('tplStep').value);
+            fd.append('subject', document.getElementById('tplSubject').value);
+            fd.append('body', document.getElementById('tplBody').value);
+            fd.append('delay_days', document.getElementById('tplDelay').value);
+            await fetch(`/api/templates/${editingTemplateId}`, { method: 'PUT', body: fd });
+
+            // 恢复按钮
+            resetTemplateForm();
+            loadTemplates();
+        }
+
+        function resetTemplateForm() {
+            editingTemplateId = null;
+            document.getElementById('tplStep').value = '1';
+            document.getElementById('tplSubject').value = '';
+            document.getElementById('tplBody').value = '';
+            document.getElementById('tplDelay').value = '0';
+            const btn = document.getElementById('tplSubmitBtn');
+            btn.textContent = '添加模板';
+            btn.setAttribute('onclick', 'addTemplate()');
+            document.getElementById('tplCancelBtn').style.display = 'none';
+            updatePreview();
+        }
+
+        async function checkAndUploadLeads() {
+            const file = document.getElementById('leadsFile').files[0];
+            if (!file) return toast('请选择文件', 'error');
+
+            // 先读取文件检查列名
+            const text = await file.text();
+            const firstLine = text.split('\n')[0];
+            const delimiter = firstLine.includes('\t') ? '\t' : ',';
+            const columns = firstLine.split(delimiter).map(c => c.trim().toLowerCase().replace(/^["']|["']$/g, ''));
+
+            const missingVars = requiredVariables.filter(v => !columns.includes(v.toLowerCase()));
+
+            if (missingVars.length > 0) {
+                showDefaultsModal(missingVars, (defaults) => doUploadLeads(file, defaults));
+            } else {
+                doUploadLeads(file, {});
+            }
+        }
+
+        async function doUploadLeads(file, defaults) {
+            const fd = new FormData();
+            fd.append('file', file);
+            fd.append('defaults', JSON.stringify(defaults));
+            const res = await api(`/api/campaigns/${currentCampaign}/leads`, { method: 'POST', body: fd });
+            toast(`导入成功: ${res.added}条, 跳过: ${res.skipped}条`, 'success');
+            document.getElementById('leadsFile').value = '';
+            loadLeads();
+        }
+
+        async function loadLeads() {
+            const leads = await api(`/api/campaigns/${currentCampaign}/leads`);
+            document.getElementById('leadsCount').textContent = `(${leads.length}人)`;
+            document.getElementById('leadsList').innerHTML = leads.map(l => `
+                <tr>
+                    <td>${l.email}</td>
+                    <td><span class="status ${l.status}">${l.status}</span></td>
+                    <td>${l.current_step}</td>
+                    <td style="font-size:12px;color:#666">${l.last_sent_at ? new Date(l.last_sent_at).toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '-'}</td>
+                    <td>${l.opened ? '✓' : '-'}</td>
+                    <td>${l.clicked ? '✓' : '-'}</td>
+                    <td>${l.replied ? '<span class="status replied">已回复</span>' : '-'}</td>
+                    <td><button class="btn-sm" onclick="previewEmail(${l.id})">预览</button></td>
+                </tr>
+            `).join('') || '<tr><td colspan="8" style="color:#888">暂无收件人</td></tr>';
+        }
+
+        async function addManualLead() {
+            const email = document.getElementById('manualEmail').value.trim();
+            if (!email) return toast('请输入邮箱', 'error');
+            const data = { email };
+
+            // 收集所有变量字段
+            requiredVariables.forEach(v => {
+                const input = document.getElementById('manual_' + v);
+                if (input) data[v] = input.value.trim();
+            });
+
+            const res = await fetch(`/api/campaigns/${currentCampaign}/leads/json`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify([data])
+            }).then(r => r.json());
+            if (res.added > 0) {
+                document.getElementById('manualEmail').value = '';
+                requiredVariables.forEach(v => {
+                    const input = document.getElementById('manual_' + v);
+                    if (input) input.value = '';
+                });
+                loadLeads();
+            } else {
+                const errMsg = res.errors && res.errors.length > 0 ? res.errors.join('\n') : '未知错误';
+                toast('添加失败: ' + errMsg, 'error');
+            }
+        }
+
+        async function checkAndParsePasted() {
+            const text = document.getElementById('pasteArea').value.trim();
+            if (!text) return toast('请粘贴数据', 'error');
+
+            const lines = text.split('\n').filter(l => l.trim());
+            if (lines.length < 2) return toast('至少需要表头+1行数据', 'error');
+
+            const delimiter = lines[0].includes('\t') ? '\t' : ',';
+            const headers = lines[0].split(delimiter).map(h => h.trim().toLowerCase());
+
+            if (!headers.includes('email')) return toast('必须包含email列', 'error');
+
+            const missingVars = requiredVariables.filter(v => !headers.includes(v.toLowerCase()));
+
+            if (missingVars.length > 0) {
+                showDefaultsModal(missingVars, (defaults) => doParsePasted(text, defaults));
+            } else {
+                doParsePasted(text, {});
+            }
+        }
+
+        async function doParsePasted(text, defaults) {
+            const lines = text.split('\n').filter(l => l.trim());
+            const delimiter = lines[0].includes('\t') ? '\t' : ',';
+            const headers = lines[0].split(delimiter).map(h => h.trim().toLowerCase());
+
+            const data = [];
+            for (let i = 1; i < lines.length; i++) {
+                const values = lines[i].split(delimiter);
+                const row = { ...defaults };  // 先填入默认值
+                headers.forEach((h, idx) => row[h] = (values[idx] || '').trim());
+                if (row.email) data.push(row);
+            }
+
+            if (data.length === 0) return toast('没有有效数据', 'error');
+
+            const res = await fetch(`/api/campaigns/${currentCampaign}/leads/json`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            }).then(r => r.json());
+
+            let msg = `导入成功: ${res.added}条, 跳过: ${res.skipped}条`;
+            if (res.errors && res.errors.length > 0) {
+                msg += '\n\n跳过原因:\n' + res.errors.join('\n');
+            }
+            toast(msg, res.errors && res.errors.length > 0 ? 'warning' : 'success', 5000);
+            if (res.added > 0) document.getElementById('pasteArea').value = '';
+            loadLeads();
+        }
+
+        async function previewEmail(leadId) {
+            const res = await api(`/api/campaigns/${currentCampaign}/preview?lead_id=${leadId}&step=1`);
+            document.getElementById('preview').innerHTML = `<p><strong>主题:</strong> ${res.subject}</p><hr>${res.body}`;
+            document.getElementById('previewModal').style.display = 'block';
+        }
+
+        async function markLead(leadId, field) {
+            await api(`/api/leads/${leadId}/mark?field=${field}`, { method: 'POST' });
+            loadLeads();
+            loadStats();
+        }
+
+        async function loadStats() {
+            const stats = await api(`/api/campaigns/${currentCampaign}/stats`);
+            const openRate = stats.total ? ((stats.opens / stats.total) * 100).toFixed(1) : 0;
+            const clickRate = stats.total ? ((stats.clicks / stats.total) * 100).toFixed(1) : 0;
+            const replyRate = stats.total ? ((stats.replies / stats.total) * 100).toFixed(1) : 0;
+            document.getElementById('statsBox').innerHTML = `
+                <div class="stat"><div class="num">${stats.total || 0}</div><div class="label">总收件人</div></div>
+                <div class="stat"><div class="num">${stats.sent || 0}</div><div class="label">已发送</div></div>
+                <div class="stat"><div class="num">${stats.opens || 0}</div><div class="label">已打开</div></div>
+                <div class="stat"><div class="num">${openRate}%</div><div class="label">打开率</div></div>
+                <div class="stat"><div class="num">${stats.clicks || 0}</div><div class="label">已点击</div></div>
+                <div class="stat"><div class="num">${clickRate}%</div><div class="label">点击率</div></div>
+                <div class="stat"><div class="num">${stats.replies || 0}</div><div class="label">已回复</div></div>
+                <div class="stat"><div class="num">${replyRate}%</div><div class="label">回复率</div></div>
+            `;
+        }
+
+        async function checkRepliesNow() {
+            const res = await api(`/api/campaigns/${currentCampaign}/check-replies`, { method: 'POST' });
+            toast(res.msg || '检查完成', 'success');
+            loadStats();
+            loadLeads();
+        }
+
+        async function launchCampaign() {
+            const fd = new FormData();
+            fd.append('account_email', document.getElementById('sendAccount').value);
+            fd.append('interval_minutes', document.getElementById('sendInterval').value);
+            const res = await api(`/api/campaigns/${currentCampaign}/launch`, { method: 'POST', body: fd });
+            toast(res.msg || '已启动', 'success');
+            loadCampaigns();
+        }
+
+        async function stopCampaign() {
+            await api(`/api/campaigns/${currentCampaign}/stop`, { method: 'POST' });
+            toast('已暂停', 'info');
+            loadCampaigns();
+        }
+
+        async function deleteCampaign(id, name) {
+            if (!confirm(`确定要删除 Campaign "${name}" 吗？\n\n此操作将删除所有相关数据（收件人、模板等），且无法恢复。`)) {
+                return;
+            }
+
+            await api(`/api/campaigns/${id}`, { method: 'DELETE' });
+            toast('Campaign 已删除', 'success');
+
+            // 如果当前正在管理这个 campaign，返回主页
+            if (currentCampaign === id) {
+                document.getElementById('campaignManage').style.display = 'none';
+                document.getElementById('campaignList').style.display = 'block';
+            }
+
+            loadCampaigns();
+        }
+
+        // ✏️ CHANGED: Settings functions for BASE_URL
+        async function loadSettings() {
+            const settings = await api('/api/settings');
+            const baseUrl = settings.base_url || '';
+            document.getElementById('baseUrlInput').value = baseUrl;
+            // Show warning if localhost
+            const warning = document.getElementById('baseUrlWarning');
+            if (baseUrl.includes('localhost') || baseUrl.includes('127.0.0.1')) {
+                warning.style.display = 'block';
+            } else {
+                warning.style.display = 'none';
+            }
+        }
+        async function saveBaseUrl() {
+            const url = document.getElementById('baseUrlInput').value.trim();
+            if (!url) return toast('Please enter a URL', 'error');
+            await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ base_url: url })
+            });
+            toast('BASE_URL saved!', 'success');
+            loadSettings();  // refresh warning
+        }
+        // end of CHANGED section
+
+        // 初始化
+        loadSettings();  // ✏️ CHANGED: load settings on startup
+        loadAccounts();
+        loadCampaigns();
+
+        // URL消息提示
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.get('msg')) {
+            document.getElementById('msg').innerHTML = `<div class="msg">${urlParams.get('msg')}</div>`;
+        }
+    </script>
+</body>
+</html>

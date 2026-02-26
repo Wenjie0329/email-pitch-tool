@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-multipart
+jinja2
+google-auth-oauthlib
+google-api-python-client
+apscheduler
+email-validator
+openpyxl
+python-dateutil
+requests
