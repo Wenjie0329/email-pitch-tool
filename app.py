@@ -5,9 +5,12 @@ import csv
 import json
 import re
 import time  # ✏️ CHANGED: added for cache-busting timestamps
+import threading
 import sqlite3
 import base64
 import html as html_module
+import hashlib as _hashlib
+import hmac as _hmac
 from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import contextmanager
@@ -18,7 +21,9 @@ from email.mime.multipart import MIMEMultipart
 from jinja2 import Template
 from openpyxl import load_workbook
 from email_validator import validate_email, EmailNotValidError
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+import secrets as _secrets
+from fastapi import FastAPI, Depends, UploadFile, File, Form, HTTPException, Request
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response  # ✏️ CHANGED: added Response for tracking GIF
 from fastapi.staticfiles import StaticFiles
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -26,14 +31,96 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
+def build_gmail_service(creds):
+    try:
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp
+        http = AuthorizedHttp(creds, http=httplib2.Http(timeout=20))
+        return build('gmail', 'v1', http=http, cache_discovery=False)
+    except Exception as e:
+        print(f"[Gmail client warning] falling back without explicit timeout: {e}")
+        return build('gmail', 'v1', credentials=creds, cache_discovery=False)
+
 app = FastAPI(title="Email Pitch Tool")
 scheduler = BackgroundScheduler()
 scheduler.start()
 
+# Per-campaign lock prevents duplicate sends when Launch is clicked twice or overlaps scheduler.
+campaign_process_locks = {}
+campaign_process_locks_guard = threading.Lock()
+
+# HTTP Basic Auth
+_security = HTTPBasic()
+_AUTH_USER = os.environ.get("AUTH_USERNAME", "admin")
+_AUTH_PASS = os.environ.get("AUTH_PASSWORD", "admin")
+_AUTH_COOKIE = "email_pitch_auth"
+
+# Paths that skip auth (tracking pixels must work without login)
+_PUBLIC_PATHS = {"/track/open", "/track/click", "/oauth/callback", "/static"}
+
+
+def _auth_cookie_value() -> str:
+    key = (_AUTH_PASS or "admin").encode("utf-8")
+    msg = f"{_AUTH_USER}:email-pitch-tool".encode("utf-8")
+    return _hmac.new(key, msg, _hashlib.sha256).hexdigest()
+
+
+def _has_valid_auth_cookie(request: Request) -> bool:
+    cookie = request.cookies.get(_AUTH_COOKIE, "")
+    return bool(cookie) and _secrets.compare_digest(cookie, _auth_cookie_value())
+
+
+def _set_auth_cookie(response, request: Request):
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").lower()
+    secure = request.url.scheme == "https" or forwarded_proto == "https"
+    response.set_cookie(
+        _AUTH_COOKIE,
+        _auth_cookie_value(),
+        max_age=7 * 24 * 60 * 60,
+        httponly=True,
+        secure=secure,
+        samesite="lax",
+    )
+
+
+@app.middleware("http")
+async def basic_auth_middleware(request: Request, call_next):
+    path = request.url.path.rstrip("/")
+    # Skip auth for tracking & OAuth callback
+    for pub in _PUBLIC_PATHS:
+        if path.startswith(pub):
+            return await call_next(request)
+
+    # Browser fetch does not always resend cached Basic credentials. Accept a
+    # cookie set after the first successful Basic Auth challenge so preview/API
+    # calls do not repeatedly trigger login dialogs.
+    if _has_valid_auth_cookie(request):
+        return await call_next(request)
+
+    # Check Basic Auth header
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Basic "):
+        import base64 as _b64
+        try:
+            decoded = _b64.b64decode(auth[6:]).decode()
+            user, pwd = decoded.split(":", 1)
+            if _secrets.compare_digest(user, _AUTH_USER) and _secrets.compare_digest(pwd, _AUTH_PASS):
+                response = await call_next(request)
+                _set_auth_cookie(response, request)
+                return response
+        except Exception:
+            pass
+    from starlette.responses import Response as _Resp
+    return _Resp(
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="Email Pitch Tool"'},
+        content="Unauthorized"
+    )
+
 # 配置
 DB_PATH = "data.db"
 CREDENTIALS_FILE = "credentials.json"  # 从Google Cloud Console下载
-SCOPES = ['https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.readonly']
+SCOPES = ['https://www.googleapis.com/auth/gmail.modify']  # covers send + read + labels + thread modify
 # 支持环境变量配置REDIRECT_URI（部署时使用）
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 REDIRECT_URI = f"{BASE_URL}/oauth/callback"
@@ -52,11 +139,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS campaigns (
             id INTEGER PRIMARY KEY, name TEXT, status TEXT DEFAULT 'draft',
             account_email TEXT, interval_minutes INTEGER DEFAULT 5,
+            cc_email TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS templates (
             id INTEGER PRIMARY KEY, campaign_id INTEGER, step INTEGER, subject TEXT, body TEXT,
-            delay_days INTEGER DEFAULT 0, FOREIGN KEY(campaign_id) REFERENCES campaigns(id)
+            delay_days INTEGER DEFAULT 0,
+            delay_hours INTEGER DEFAULT 0,
+            FOREIGN KEY(campaign_id) REFERENCES campaigns(id)
         );
         CREATE TABLE IF NOT EXISTS leads (
             id INTEGER PRIMARY KEY, campaign_id INTEGER, email TEXT, data TEXT,
@@ -66,9 +156,34 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS blacklist (email TEXT PRIMARY KEY);
 
+        CREATE TABLE IF NOT EXISTS oauth_states (
+            state TEXT PRIMARY KEY,
+            code_verifier TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         /* ✏️ CHANGED: new settings table to store BASE_URL from the web UI */
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
     """)
+
+    # ✏️ CC support: migrate existing databases
+    try:
+        conn.execute("ALTER TABLE campaigns ADD COLUMN cc_email TEXT DEFAULT ''")
+    except:
+        pass  # column already exists
+
+    # ✏️ Threading support: store message_id and thread_id for follow-up threading
+    for col in ('message_id', 'thread_id'):
+        try:
+            conn.execute(f"ALTER TABLE leads ADD COLUMN {col} TEXT DEFAULT ''")
+        except:
+            pass  # column already exists
+
+    # ✏️ Follow-up delay support: allow hour-level delays for faster tests
+    try:
+        conn.execute("ALTER TABLE templates ADD COLUMN delay_hours INTEGER DEFAULT 0")
+    except:
+        pass  # column already exists
     conn.commit()
     conn.close()
 init_db()
@@ -85,18 +200,58 @@ def get_tracking_base_url():
         pass
     return os.environ.get("BASE_URL", "http://localhost:8000").rstrip('/')
 
-# ✏️ CHANGED: Auto-detect plain text vs HTML; plain text supports Markdown-style links/images
+# Markdown-to-HTML email body processor with list support
 def prepare_email_body(body: str) -> str:
     """If body has no HTML tags, treat as plain text with Markdown support.
-    Supports: ![alt](url), [text](url), **bold**, *italic*, bare URLs, newlines."""
+    Supports: ![alt](url), [text](url), **bold**, *italic*, bare URLs, lists, newlines."""
     if re.search(r'<[a-zA-Z][^>]*>', body):
         return body  # already HTML
+
+    # Normalize line endings (browser forms send \r\n)
+    body = body.replace('\r\n', '\n').replace('\r', '\n')
 
     # Process Markdown syntax BEFORE escaping (so URLs stay intact)
     body = re.sub(r'!\[([^\]]*)\]\(([^)]+)\)', r'<img src="\2" alt="\1" style="max-width:100%">', body)
     body = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', body)
     body = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', body)
     body = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', body)
+
+    # Process Markdown lists: convert '- item' to <ul><li> and '1. item' to <ol><li>
+    lines = body.split('\n')
+    processed = []
+    in_list = False
+    list_type = None
+    for line in lines:
+        stripped = line.strip()
+        is_ul = bool(re.match(r'^[-]\s+', stripped))
+        is_ol = bool(re.match(r'^\d+\.\s+', stripped))
+        if is_ul:
+            item_text = re.sub(r'^[-]\s+', '', stripped)
+            if not in_list or list_type != 'ul':
+                if in_list:
+                    processed.append('</' + list_type + '>')
+                processed.append('<ul style="margin:8px 0;padding-left:20px">')
+                in_list = True
+                list_type = 'ul'
+            processed.append('<li style="margin:2px 0">' + item_text + '</li>')
+        elif is_ol:
+            item_text = re.sub(r'^\d+\.\s+', '', stripped)
+            if not in_list or list_type != 'ol':
+                if in_list:
+                    processed.append('</' + list_type + '>')
+                processed.append('<ol style="margin:8px 0;padding-left:20px">')
+                in_list = True
+                list_type = 'ol'
+            processed.append('<li style="margin:2px 0">' + item_text + '</li>')
+        else:
+            if in_list:
+                processed.append('</' + list_type + '>')
+                in_list = False
+                list_type = None
+            processed.append(line)
+    if in_list:
+        processed.append('</' + list_type + '>')
+    body = '\n'.join(processed)
 
     # Escape plain text parts only (not the HTML tags we just created)
     parts = re.split(r'(<[^>]+>)', body)
@@ -112,6 +267,60 @@ def prepare_email_body(body: str) -> str:
 
     body = ''.join(result)
     return body.replace('\n', '<br>\n')
+
+
+def normalize_template_key(key: str) -> str:
+    """Normalize CSV headers and template vars for forgiving placeholder matching."""
+    return re.sub(r'[^a-z0-9]+', '_', str(key or '').strip().lower()).strip('_')
+
+
+def lookup_template_value(key: str, data: dict):
+    if key in data:
+        return data.get(key)
+    wanted = normalize_template_key(key)
+    if not wanted:
+        return None
+    for existing_key, value in data.items():
+        if normalize_template_key(existing_key) == wanted:
+            return value
+    return None
+
+
+def render_template_text(template_text: str, data: dict) -> str:
+    """Render placeholders while supporting CSV headers like {{Company Name}}."""
+    def replace_raw_placeholder(match):
+        key = match.group(1).strip()
+        default = match.group(2).strip() if match.group(2) is not None else None
+        value = lookup_template_value(key, data)
+        if value is not None and str(value) != "":
+            return str(value)
+        if default is not None:
+            return default
+        # Keep normal Jinja identifiers available for the legacy renderer.
+        if re.match(r'^[A-Za-z_][A-Za-z0-9_\.]*$', key):
+            return match.group(0)
+        return ""
+
+    normalized = re.sub(r'\{\{\s*([^{}|]+?)\s*(?:\|([^{}]*))?\}\}', replace_raw_placeholder, template_text or "")
+    return Template(normalized).render(**data)
+
+def threaded_reply_subject(original_subject: str) -> str:
+    """Use a stable reply subject so Gmail keeps follow-ups in the same thread."""
+    subject = (original_subject or '').strip()
+    if subject.lower().startswith('re:'):
+        return subject
+    return f"Re: {subject}" if subject else subject
+
+def get_followup_subject(conn, cid: int, data: dict, fallback_subject: str = "") -> str:
+    """Follow-up emails always reuse Step 1's subject for Gmail threading."""
+    first_tpl = conn.execute(
+        "SELECT subject FROM templates WHERE campaign_id=? AND step=1 ORDER BY id LIMIT 1",
+        (cid,)
+    ).fetchone()
+    base_subject = fallback_subject
+    if first_tpl and first_tpl['subject']:
+        base_subject = render_template_text(first_tpl['subject'], data)
+    return threaded_reply_subject(base_subject)
 
 def check_all_replies():
     """定期检查所有campaign的回复"""
@@ -177,11 +386,22 @@ def oauth_start():
     else:
         return {"error": "请先配置 Google OAuth 凭据（credentials.json 或环境变量）"}
 
-    auth_url, _ = flow.authorization_url(prompt='consent')
+    auth_url, state = flow.authorization_url(prompt='consent')
+    code_verifier = getattr(flow, "code_verifier", None)
+    if not code_verifier:
+        code_verifier = getattr(flow.oauth2session._client, "code_verifier", None)
+    if code_verifier:
+        with get_db() as conn:
+            conn.execute("DELETE FROM oauth_states WHERE created_at < datetime('now', '-1 hour')")
+            conn.execute(
+                "INSERT OR REPLACE INTO oauth_states(state, code_verifier) VALUES(?, ?)",
+                (state, code_verifier),
+            )
+            conn.commit()
     return RedirectResponse(auth_url)
 
 @app.get("/oauth/callback")
-def oauth_callback(code: str):
+def oauth_callback(code: str, state: str = ""):
     # 使用动态REDIRECT_URI
     redirect_uri = f"{BASE_URL}/oauth/callback"
 
@@ -200,9 +420,21 @@ def oauth_callback(code: str):
     else:
         flow = Flow.from_client_secrets_file(CREDENTIALS_FILE, scopes=SCOPES, redirect_uri=redirect_uri)
 
-    flow.fetch_token(code=code)
+    code_verifier = None
+    if state:
+        with get_db() as conn:
+            row = conn.execute("SELECT code_verifier FROM oauth_states WHERE state=?", (state,)).fetchone()
+            if row:
+                code_verifier = row["code_verifier"]
+                conn.execute("DELETE FROM oauth_states WHERE state=?", (state,))
+                conn.commit()
+
+    if code_verifier:
+        flow.fetch_token(code=code, code_verifier=code_verifier)
+    else:
+        flow.fetch_token(code=code)
     creds = flow.credentials
-    service = build('gmail', 'v1', credentials=creds)
+    service = build_gmail_service(creds)
     profile = service.users().getProfile(userId='me').execute()
     email = profile['emailAddress']
     with get_db() as conn:
@@ -226,10 +458,10 @@ def list_campaigns():
         return [dict(r) for r in rows]
 
 @app.post("/api/campaigns/{cid}/templates")
-def add_template(cid: int, step: int = Form(...), subject: str = Form(...), body: str = Form(...), delay_days: int = Form(0)):
+def add_template(cid: int, step: int = Form(...), subject: str = Form(""), body: str = Form(...), delay_days: int = Form(0), delay_hours: int = Form(0)):
     with get_db() as conn:
-        conn.execute("INSERT INTO templates(campaign_id, step, subject, body, delay_days) VALUES(?,?,?,?,?)",
-                    (cid, step, subject, body, delay_days))
+        conn.execute("INSERT INTO templates(campaign_id, step, subject, body, delay_days, delay_hours) VALUES(?,?,?,?,?,?)",
+                    (cid, step, subject, body, delay_days, delay_hours))
         conn.commit()
     return {"ok": True}
 
@@ -240,10 +472,10 @@ def get_templates(cid: int):
         return [dict(r) for r in rows]
 
 @app.put("/api/templates/{tid}")
-def update_template(tid: int, step: int = Form(...), subject: str = Form(...), body: str = Form(...), delay_days: int = Form(0)):
+def update_template(tid: int, step: int = Form(...), subject: str = Form(""), body: str = Form(...), delay_days: int = Form(0), delay_hours: int = Form(0)):
     with get_db() as conn:
-        conn.execute("UPDATE templates SET step=?, subject=?, body=?, delay_days=? WHERE id=?",
-                    (step, subject, body, delay_days, tid))
+        conn.execute("UPDATE templates SET step=?, subject=?, body=?, delay_days=?, delay_hours=? WHERE id=?",
+                    (step, subject, body, delay_days, delay_hours, tid))
         conn.commit()
     return {"ok": True}
 
@@ -265,8 +497,8 @@ def get_campaign_variables(cid: int):
             # 匹配 {{var}} 或 {{var|default}}
             for text in [row['subject'], row['body']]:
                 if text:
-                    matches = re.findall(r'\{\{(\w+)(?:\|[^}]*)?\}\}', text)
-                    variables.update(matches)
+                    matches = re.findall(r'\{\{\s*([^{}|]+?)(?:\|[^}]*)?\s*\}\}', text)
+                    variables.update(m.strip() for m in matches if m.strip())
     # email是必须的，不需要提示
     variables.discard('email')
     return {"variables": sorted(variables)}
@@ -365,25 +597,50 @@ def preview_email(cid: int, lead_id: int, step: int = 1):
         if not lead or not tpl: raise HTTPException(404)
         data = json.loads(lead['data'])
         data['email'] = lead['email']
+        subject = render_template_text(tpl['subject'], data)
+        if step > 1:
+            subject = get_followup_subject(conn, cid, data, subject)
         return {
-            "subject": Template(tpl['subject']).render(**data),
-            "body": Template(tpl['body']).render(**data)
+            "subject": subject,
+            "body": prepare_email_body(render_template_text(tpl['body'], data))
         }
 
-@app.post("/api/campaigns/{cid}/launch")
-def launch_campaign(cid: int, account_email: str = Form(...), interval_minutes: int = Form(5)):
+@app.post("/api/campaigns/{cid}/save-settings")
+def save_campaign_settings(cid: int, account_email: str = Form(""), interval_minutes: int = Form(5), cc_email: str = Form("")):
     with get_db() as conn:
-        conn.execute("UPDATE campaigns SET status='running', account_email=?, interval_minutes=? WHERE id=?",
-                    (account_email, interval_minutes, cid))
+        conn.execute("UPDATE campaigns SET account_email=?, interval_minutes=?, cc_email=? WHERE id=?",
+                    (account_email, interval_minutes, cc_email, cid))
         conn.commit()
+    return {"ok": True, "msg": "设置已保存"}
 
-    # 立即发送第一封邮件
-    process_campaign(cid, account_email)
+@app.post("/api/campaigns/{cid}/launch")
+def launch_campaign(cid: int, account_email: str = Form(...), interval_minutes: int = Form(5), cc_email: str = Form('')):
+    lock = _get_campaign_process_lock(cid)
+    if not lock.acquire(timeout=60):
+        raise HTTPException(status_code=409, detail="Campaign 正在启动中，请稍后再试")
 
-    # 添加定时任务继续发送后续邮件
-    scheduler.add_job(process_campaign, 'interval', minutes=interval_minutes,
-                      args=[cid, account_email], id=f"campaign_{cid}", replace_existing=True)
-    return {"ok": True, "msg": f"已启动，立即发送第一封，之后每{interval_minutes}分钟发送一封"}
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT status FROM campaigns WHERE id=?", (cid,)).fetchone()
+            if not row:
+                raise HTTPException(404)
+            was_running = row['status'] == 'running'
+            conn.execute("UPDATE campaigns SET status='running', account_email=?, interval_minutes=?, cc_email=? WHERE id=?",
+                        (account_email, interval_minutes, cc_email, cid))
+            conn.commit()
+
+        # 添加/刷新定时任务继续发送后续邮件
+        scheduler.add_job(process_campaign, 'interval', minutes=interval_minutes,
+                          args=[cid, account_email], id=f"campaign_{cid}", replace_existing=True)
+
+        if was_running:
+            return {"ok": True, "msg": f"Campaign 已在运行，已更新为每{interval_minutes}分钟检查一次"}
+
+        # 首次启动时立即处理一封；Launch 本身也串行化，避免双击触发两次即时发送。
+        _process_campaign_locked(cid, account_email)
+        return {"ok": True, "msg": f"已启动，立即发送第一封，之后每{interval_minutes}分钟检查一次"}
+    finally:
+        lock.release()
 
 @app.get("/api/campaigns/{cid}")
 def get_campaign(cid: int):
@@ -419,121 +676,285 @@ def delete_campaign(cid: int):
 
     return {"ok": True, "msg": "Campaign 已删除"}
 
-def send_gmail(account_email: str, to: str, subject: str, body: str) -> bool:
+
+# Gmail label helper for auto-labeling outreach threads
+_label_cache = {}  # email -> label_id
+
+def get_or_create_gmail_label(service, label_name="Backlink Outreach"):
+    """Get existing label ID or create a new one. Cached per session."""
+    cache_key = label_name
+    if cache_key in _label_cache:
+        return _label_cache[cache_key]
+    try:
+        results = service.users().labels().list(userId='me').execute()
+        for lbl in results.get('labels', []):
+            if lbl['name'] == label_name:
+                _label_cache[cache_key] = lbl['id']
+                return lbl['id']
+        # Create label if not found
+        label_body = {
+            'name': label_name,
+            'labelListVisibility': 'labelShow',
+            'messageListVisibility': 'show'
+        }
+        created = service.users().labels().create(userId='me', body=label_body).execute()
+        _label_cache[cache_key] = created['id']
+        return created['id']
+    except Exception as e:
+        print(f"[Label] Error: {e}")
+        return None
+
+def send_gmail(account_email: str, to: str, subject: str, body: str, cc: str = '',
+               thread_id: str = None, in_reply_to: str = None) -> dict:
+    """Send email via Gmail API. Returns dict with ok, message_id, thread_id."""
     if TEST_MODE:
         print(f"[TEST MODE] Would send email:")
         print(f"  From: {account_email}")
         print(f"  To: {to}")
         print(f"  Subject: {subject}")
+        print(f"  CC: {cc}")
         print(f"  Body: {body[:200]}...")
-        return True
+        return {'ok': True, 'message_id': '', 'thread_id': ''}
 
     with get_db() as conn:
         row = conn.execute("SELECT token FROM accounts WHERE email=?", (account_email,)).fetchone()
-        if not row: return False
+        if not row: return {'ok': False, 'message_id': '', 'thread_id': ''}
     creds = Credentials.from_authorized_user_info(json.loads(row['token']))
-    service = build('gmail', 'v1', credentials=creds)
+    service = build_gmail_service(creds)
     msg = MIMEMultipart('alternative')
     msg['To'], msg['Subject'] = to, subject
+    if cc:
+        msg['Cc'] = cc
+    # ✏️ Threading: set In-Reply-To and References for follow-up emails
+    if in_reply_to:
+        msg['In-Reply-To'] = in_reply_to
+        msg['References'] = in_reply_to
     msg.attach(MIMEText(body, 'html'))
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-    service.users().messages().send(userId='me', body={'raw': raw}).execute()
-    return True
+    # ✏️ Threading: pass threadId so Gmail groups messages in the same thread
+    send_body = {'raw': raw}
+    if thread_id:
+        send_body['threadId'] = thread_id
+    sent = service.users().messages().send(userId='me', body=send_body).execute()
+
+    # Extract Message-ID header from sent message for future threading
+    sent_message_id = ''
+    sent_thread_id = sent.get('threadId', '')
+    try:
+        sent_detail = service.users().messages().get(
+            userId='me', id=sent['id'], format='metadata',
+            metadataHeaders=['Message-ID']
+        ).execute()
+        hdrs = sent_detail.get('payload', {}).get('headers', [])
+        sent_message_id = next(
+            (h['value'] for h in hdrs if h.get('name', '').lower() == 'message-id'),
+            ''
+        )
+    except Exception as e:
+        print(f"[Threading] Could not retrieve Message-ID: {e}")
+
+    # Auto-label the thread for easy tracking
+    try:
+        label_id = get_or_create_gmail_label(service)
+        if label_id and sent_thread_id:
+            service.users().threads().modify(
+                userId='me', id=sent_thread_id,
+                body={'addLabelIds': [label_id]}
+            ).execute()
+    except Exception as e:
+        print(f"[Label] Could not label thread: {e}")
+    return {'ok': True, 'message_id': sent_message_id, 'thread_id': sent_thread_id}
+
+def _header_map(message: dict) -> dict:
+    headers = message.get('payload', {}).get('headers', [])
+    return {h.get('name', '').lower(): h.get('value', '') for h in headers}
+
+def _extract_email(header_value: str) -> str:
+    from email.utils import getaddresses
+    addresses = getaddresses([header_value or ''])
+    for _, addr in addresses:
+        if addr:
+            return addr.lower().strip()
+    match = re.search(r'<(.+?)>', header_value or '')
+    return (match.group(1) if match else (header_value or '')).lower().strip()
+
+def _parse_email_time(value: str):
+    from email.utils import parsedate_to_datetime
+    from dateutil import parser as dateparser
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except Exception:
+        parsed = dateparser.parse(value)
+    if parsed and parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    return parsed
+
+def _is_auto_reply(sender: str, headers: dict) -> bool:
+    local_part = sender.split('@', 1)[0].lower()
+    subject = headers.get('subject', '').lower()
+    auto_submitted = headers.get('auto-submitted', '').lower()
+    precedence = headers.get('precedence', '').lower()
+    if local_part in {'mailer-daemon', 'postmaster'}:
+        return True
+    if local_part in {'no-reply', 'noreply', 'do-not-reply'}:
+        return True
+    if auto_submitted and auto_submitted != 'no':
+        return True
+    if precedence in {'bulk', 'junk', 'list'}:
+        return True
+    if 'delivery status notification' in subject:
+        return True
+    return False
+
+def _message_is_human_inbound(message: dict, account_email: str) -> tuple[bool, str, dict]:
+    headers = _header_map(message)
+    sender = _extract_email(headers.get('from', ''))
+    labels = set(message.get('labelIds', []))
+    if not sender:
+        return False, sender, headers
+    if sender == account_email.lower().strip() or 'SENT' in labels:
+        return False, sender, headers
+    if _is_auto_reply(sender, headers):
+        return False, sender, headers
+    return True, sender, headers
 
 def check_replies(cid: int, account_email: str):
-    """检查收件箱，标记已回复的leads"""
+    """检查Gmail thread/inbox，标记已回复的leads"""
     if TEST_MODE:
         print(f"[TEST MODE] Skipping reply check for campaign {cid}")
         return
 
     try:
-        # 首先获取认证信息和leads列表（快速查询，避免长时间持有连接）
         with get_db() as conn:
             row = conn.execute("SELECT token FROM accounts WHERE email=?", (account_email,)).fetchone()
             if not row:
                 return
 
             token_json = row['token']
-
-            # 获取该campaign所有未回复的lead邮箱
-            # 重要：只检查已经发送过邮件的leads (last_sent_at IS NOT NULL)
             leads = conn.execute(
-                "SELECT id, email, last_sent_at FROM leads WHERE campaign_id=? AND replied=0 AND last_sent_at IS NOT NULL", (cid,)
+                """
+                SELECT id, email, last_sent_at, thread_id
+                FROM leads
+                WHERE campaign_id=? AND status='pending' AND replied=0 AND last_sent_at IS NOT NULL
+                """,
+                (cid,)
             ).fetchall()
             if not leads:
                 return
 
-        # 释放数据库连接后再进行Gmail API调用（耗时操作）
-        # 存储 {email: (lead_id, last_sent_at)}
-        lead_emails = {l['email'].lower(): (l['id'], l['last_sent_at']) for l in leads}
-
         creds = Credentials.from_authorized_user_info(json.loads(token_json))
-        service = build('gmail', 'v1', credentials=creds)
-
-        # 查询最近7天的收件邮件
-        results = service.users().messages().list(
-            userId='me', q='in:inbox newer_than:7d', maxResults=100
-        ).execute()
-
-        messages = results.get('messages', [])
+        service = build_gmail_service(creds)
         replied_lead_ids = []
 
-        for msg in messages:
-            msg_detail = service.users().messages().get(
-                userId='me', id=msg['id'], format='metadata',
-                metadataHeaders=['From', 'Date']
-            ).execute()
+        for lead in leads:
+            lead_id = lead['id']
+            lead_email = lead['email'].lower().strip()
+            try:
+                last_sent_time = _parse_email_time(lead['last_sent_at'])
+            except Exception as e:
+                print(f"[Date parse error for {lead_email}] {e}")
+                continue
 
-            headers = msg_detail.get('payload', {}).get('headers', [])
-            from_header = next((h['value'] for h in headers if h['name'] == 'From'), '')
-            date_header = next((h['value'] for h in headers if h['name'] == 'Date'), '')
-
-            # 提取发件人邮箱
-            import re
-            match = re.search(r'<(.+?)>', from_header)
-            sender = (match.group(1) if match else from_header).lower().strip()
-
-            # 如果发件人在我们的leads列表中
-            if sender in lead_emails:
-                lead_id, last_sent_at = lead_emails[sender]
-
-                # 获取邮件接收时间
+            thread_id = lead['thread_id']
+            if thread_id:
                 try:
-                    from email.utils import parsedate_to_datetime
-                    received_time = parsedate_to_datetime(date_header)
+                    thread = service.users().threads().get(
+                        userId='me', id=thread_id, format='metadata',
+                        metadataHeaders=[
+                            'From', 'Date', 'Subject', 'Auto-Submitted',
+                            'Precedence', 'Message-ID', 'In-Reply-To', 'References'
+                        ]
+                    ).execute()
+                    messages = thread.get('messages', [])
+                    sent_times = []
+                    inbound_messages = []
 
-                    # 解析发送时间
-                    from dateutil import parser as dateparser
-                    sent_time = dateparser.parse(last_sent_at)
+                    for message in messages:
+                        headers = _header_map(message)
+                        sender = _extract_email(headers.get('from', ''))
+                        labels = set(message.get('labelIds', []))
+                        msg_time = _parse_email_time(headers.get('date', ''))
+                        if msg_time and (sender == account_email.lower().strip() or 'SENT' in labels):
+                            sent_times.append(msg_time)
+                        is_inbound, inbound_sender, inbound_headers = _message_is_human_inbound(message, account_email)
+                        if is_inbound:
+                            inbound_messages.append((inbound_sender, inbound_headers, msg_time))
 
-                    # 统一转换为 naive datetime（移除时区信息）以便比较
-                    if received_time.tzinfo is not None:
-                        received_time = received_time.replace(tzinfo=None)
-                    if sent_time.tzinfo is not None:
-                        sent_time = sent_time.replace(tzinfo=None)
-
-                    # 只有邮件是在我们发送之后收到的，才算作回复
-                    if received_time > sent_time:
+                    first_sent_time = min(sent_times) if sent_times else last_sent_time
+                    for sender, headers, received_time in inbound_messages:
+                        if received_time and first_sent_time and received_time <= first_sent_time:
+                            continue
                         replied_lead_ids.append((lead_id, sender))
-                        print(f"[Reply] {sender} replied (sent: {sent_time}, received: {received_time})")
-                    else:
-                        print(f"[Skip] {sender} email too old (sent: {sent_time}, received: {received_time})")
-                except Exception as e:
-                    print(f"[Date parse error] {e}, skipping message")
+                        print(f"[Reply] lead {lead_id} thread reply from {sender} (first sent: {first_sent_time}, received: {received_time})")
+                        break
                     continue
+                except Exception as e:
+                    print(f"[Thread reply check error for lead {lead_id}] {e}")
 
-        # 批量更新数据库（一次性提交，减少锁定时间）
+            try:
+                results = service.users().messages().list(
+                    userId='me', q=f'from:{lead_email} newer_than:30d', maxResults=5
+                ).execute()
+                for msg in results.get('messages', []):
+                    msg_detail = service.users().messages().get(
+                        userId='me', id=msg['id'], format='metadata',
+                        metadataHeaders=['From', 'Date', 'Subject', 'Auto-Submitted', 'Precedence']
+                    ).execute()
+                    is_inbound, sender, headers = _message_is_human_inbound(msg_detail, account_email)
+                    if not is_inbound or sender != lead_email:
+                        continue
+                    received_time = _parse_email_time(headers.get('date', ''))
+                    if received_time and last_sent_time and received_time <= last_sent_time:
+                        continue
+                    replied_lead_ids.append((lead_id, sender))
+                    print(f"[Reply] lead {lead_id} direct reply from {sender} (sent: {last_sent_time}, received: {received_time})")
+                    break
+            except Exception as e:
+                print(f"[Direct reply check error for lead {lead_id}] {e}")
+
         if replied_lead_ids:
+            seen = set()
+            unique_replies = []
+            for lead_id, sender in replied_lead_ids:
+                if lead_id not in seen:
+                    seen.add(lead_id)
+                    unique_replies.append((lead_id, sender))
+
             with get_db() as conn:
-                for lead_id, sender in replied_lead_ids:
-                    conn.execute("UPDATE leads SET replied=1, status='replied' WHERE id=?", (lead_id,))
+                for lead_id, sender in unique_replies:
+                    conn.execute("UPDATE leads SET replied=1, opened=1, status='replied' WHERE id=?", (lead_id,))
                     print(f"[Reply detected] Lead {lead_id} ({sender}) replied")
                 conn.commit()
 
     except Exception as e:
         print(f"[Check replies error] {e}")
 
+def _get_campaign_process_lock(cid: int):
+    with campaign_process_locks_guard:
+        if cid not in campaign_process_locks:
+            campaign_process_locks[cid] = threading.Lock()
+        return campaign_process_locks[cid]
+
+
 def process_campaign(cid: int, account_email: str):
+    lock = _get_campaign_process_lock(cid)
+    if not lock.acquire(blocking=False):
+        print(f"[Campaign {cid}] process already running, skip duplicate trigger")
+        return
+    try:
+        _process_campaign_locked(cid, account_email)
+    finally:
+        lock.release()
+
+
+def _process_campaign_locked(cid: int, account_email: str):
+    with get_db() as conn:
+        campaign = conn.execute("SELECT status FROM campaigns WHERE id=?", (cid,)).fetchone()
+        if not campaign or campaign['status'] != 'running':
+            return
+
     # 先检查回复
     check_replies(cid, account_email)
 
@@ -541,7 +962,8 @@ def process_campaign(cid: int, account_email: str):
         lead = conn.execute("""
             SELECT l.* FROM leads l WHERE l.campaign_id=? AND l.status='pending' AND l.replied=0
             AND (l.last_sent_at IS NULL OR datetime(l.last_sent_at, '+' ||
-                (SELECT delay_days FROM templates WHERE campaign_id=? AND step=l.current_step) || ' days') <= datetime('now'))
+                (SELECT ((COALESCE(delay_days, 0) * 24) + COALESCE(delay_hours, 0))
+                 FROM templates WHERE campaign_id=? AND step=l.current_step) || ' hours') <= datetime('now'))
             LIMIT 1
         """, (cid, cid)).fetchone()
         if not lead: return
@@ -554,8 +976,8 @@ def process_campaign(cid: int, account_email: str):
 
         data = json.loads(lead['data'])
         data['email'] = lead['email']
-        subject = Template(tpl['subject']).render(**data)
-        body = Template(tpl['body']).render(**data)
+        subject = render_template_text(tpl['subject'], data)
+        body = render_template_text(tpl['body'], data)
 
         # ✏️ CHANGED: Auto-detect plain text vs HTML — plain text gets newlines converted to <br>
         body = prepare_email_body(body)
@@ -573,12 +995,28 @@ def process_campaign(cid: int, account_email: str):
             track_pixel = f'<img src="{base_url}/track/open/{lead["id"]}?t={cache_bust}" width="1" height="1" alt="" border="0">'
         body += track_pixel
 
-        if send_gmail(account_email, lead['email'], subject, body):
+        # ✏️ CC support: read cc_email from campaign settings
+        campaign_row = conn.execute("SELECT cc_email FROM campaigns WHERE id=?", (cid,)).fetchone()
+        cc_email = campaign_row['cc_email'] if campaign_row and campaign_row['cc_email'] else ''
+
+        # ✏️ Threading: pass stored thread_id/message_id for follow-up steps
+        _thread_id = lead['thread_id'] if lead['thread_id'] else None
+        _in_reply_to = lead['message_id'] if lead['message_id'] else None
+        if lead['current_step'] > 1:
+            subject = get_followup_subject(conn, cid, data, subject)
+
+        result = send_gmail(account_email, lead['email'], subject, body, cc=cc_email,
+                           thread_id=_thread_id, in_reply_to=_in_reply_to)
+        if result['ok']:
             next_tpl = conn.execute("SELECT * FROM templates WHERE campaign_id=? AND step=?",
                                    (cid, lead['current_step'] + 1)).fetchone()
             new_status = 'pending' if next_tpl else 'completed'
-            conn.execute("UPDATE leads SET current_step=current_step+1, last_sent_at=?, status=? WHERE id=?",
-                        (datetime.now().isoformat(), new_status, lead['id']))
+            # Store threading info so future steps land in the same thread
+            new_msg_id = result.get('message_id', '') or lead['message_id'] or ''
+            new_thread_id = result.get('thread_id', '') or lead['thread_id'] or ''
+            conn.execute(
+                "UPDATE leads SET current_step=current_step+1, last_sent_at=?, status=?, message_id=?, thread_id=? WHERE id=?",
+                (datetime.now().isoformat(), new_status, new_msg_id, new_thread_id, lead['id']))
             conn.commit()
 
 # 追踪
@@ -660,7 +1098,7 @@ def mark_lead(lead_id: int, field: str):
         raise HTTPException(400, "Invalid field")
     with get_db() as conn:
         if field == 'replied':
-            conn.execute("UPDATE leads SET replied=1, status='replied' WHERE id=?", (lead_id,))
+            conn.execute("UPDATE leads SET replied=1, opened=1, status='replied' WHERE id=?", (lead_id,))
         else:
             conn.execute(f"UPDATE leads SET {field}=1 WHERE id=?", (lead_id,))
         conn.commit()
@@ -798,7 +1236,14 @@ if os.environ.get("TRACKER_URL"):
 # 前端页面
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return Path("index.html").read_text(encoding='utf-8')
+    content = Path("index.html").read_text(encoding='utf-8')
+    return HTMLResponse(content=content, headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+    })
+
+# Serve static files (logos, images)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # 启动时恢复运行中的 campaigns（延迟执行，确保所有函数已定义）
 scheduler.add_job(restore_running_campaigns, 'date', id='restore_on_start')
@@ -809,7 +1254,7 @@ if __name__ == "__main__":
     if "localhost" in effective_url or "127.0.0.1" in effective_url:
         print("\n" + "=" * 60)
         print("  WARNING: BASE_URL is set to localhost.")
-        print("  Email open/click tracking will NOT work!")
+        print("  Email open tracking will NOT work!")
         print("  ")
         print("  To fix: open the web UI and set a public URL in Settings,")
         print("  or use ngrok:  ngrok http 8000")

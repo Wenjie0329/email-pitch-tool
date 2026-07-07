@@ -1,6 +1,6 @@
 # Email Pitch Tool
 
-A lightweight email outreach automation tool. Send personalized cold emails, set up multi-step follow-up sequences, and track open/click/reply rates.
+A lightweight email outreach automation tool. Send personalized cold emails, set up multi-step follow-up sequences, and track open/reply rates.
 
 **Tech stack:** Python (FastAPI) + Vanilla JS + SQLite + Gmail API
 
@@ -11,7 +11,7 @@ A lightweight email outreach automation tool. Send personalized cold emails, set
 - **Personalized templates** - Use variables like `{{first_name}}`, `{{company}}`
 - **Plain text + Markdown support** - Write emails naturally with `**bold**`, `[links](url)`, `![images](url)`, or use HTML
 - **Multi-step sequences** - Automatic follow-up emails with configurable delays
-- **Open/click/reply tracking** - Track engagement via a free Render-hosted tracker
+- **Open/reply tracking** - Track opens via a tracking pixel and detect replies from Gmail threads
 - **Auto sync** - Tracking data syncs every 10 minutes
 
 ---
@@ -52,8 +52,7 @@ This is the most important step. You need to create a Google Cloud project so th
    - Developer contact: your email
 4. Click **Save and Continue**
 5. On the **Scopes** page, click **Add or Remove Scopes**, add:
-   - `https://www.googleapis.com/auth/gmail.send`
-   - `https://www.googleapis.com/auth/gmail.readonly`
+   - `https://www.googleapis.com/auth/gmail.modify`
 6. Click **Save and Continue**
 7. On **Test users**, click **Add Users**, add your Gmail address
 8. Click **Save and Continue**
@@ -87,7 +86,7 @@ Open `http://localhost:8000` in your browser.
 
 ### 4. Connect Gmail
 
-1. Click **+ Bindind Gmail Account** in the web UI
+1. Click **+ Binding Gmail Account** in the web UI
 2. Log in with the Gmail account you added as a test user
 3. Grant permissions
 
@@ -95,7 +94,7 @@ You're ready to send emails!
 
 ---
 
-## Set Up Open Rate Tracking (Recommended)
+## Set Up Open Tracking (Recommended)
 
 By default, open tracking won't work because the tracking pixel URL points to `localhost`, which email clients can't reach. To fix this, deploy the lightweight tracker service to [Render](https://render.com/) (free).
 
@@ -206,6 +205,8 @@ If you include any HTML tags (like `<p>`, `<b>`, `<a>`), the body is sent as raw
 ```
 
 ---
+
+> Note: the codebase includes click-tracking endpoints and data fields, but outgoing email links are not automatically rewritten through the tracker yet. Treat click tracking as experimental until link rewriting is implemented.
 
 ## Environment Variables
 

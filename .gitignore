@@ -25,6 +25,11 @@ venv/
 # Backup files
 *.backup
 *.backup-v1
+*.bak
+*.bak*
+*.bak_*
+*.old
+*.orig
 
 # Test files
 test_*.py
